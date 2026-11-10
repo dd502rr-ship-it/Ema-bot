@@ -195,6 +195,8 @@ def check_ema(m, symbol, interval, k, alerts):
     if len(closes) < max(EMA_PERIODS) + 2:
         return
     price, prev = closes[-1], closes[-2]
+    hi, lo = float(k[-1][2]), float(k[-1][3])   # current candle high/low (wick)
+    candle = k[-1][0]                            # current candle open time
     tf = "(" + label + ")"
 
     for p in EMA_PERIODS:
@@ -207,8 +209,9 @@ def check_ema(m, symbol, interval, k, alerts):
             if can_alert(m, symbol, interval, p, "cross", cooldown=cooldown):
                 alerts.append((2, f"\U0001f4ca <b>{symbol}</b> [{mk}] {kind} EMA{p} {tf}\n"
                                   f"\u0627\u0644\u0633\u0639\u0631: {price:g} | EMA{p}: {ema:.6g}"))
-        elif abs(dist) <= TOUCH_PCT:
-            if can_alert(m, symbol, interval, p, "touch", cooldown=cooldown):
+        elif lo <= ema <= hi or abs(dist) <= TOUCH_PCT:
+            # touched the line (wick or body) in the current candle: one alert per candle
+            if can_alert(m, symbol, interval, p, "touch", candle, cooldown=24 * 3600):
                 alerts.append((3, f"\U0001f3af <b>{symbol}</b> [{mk}] \u0648\u0635\u0644 \u0625\u0644\u0649 EMA{p} {tf}\n"
                                   f"\u0627\u0644\u0633\u0639\u0631: {price:g} | EMA{p}: {ema:.6g} | \u0627\u0644\u0628\u0639\u062f: {dist:+.2f}%"))
 
