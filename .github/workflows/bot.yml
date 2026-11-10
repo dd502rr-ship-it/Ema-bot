@@ -1,11 +1,14 @@
 name: ema-bot
+
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "* * * * *"
   workflow_dispatch:
+
 concurrency:
   group: ema-bot
   cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
