@@ -79,6 +79,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 state = {}
 _good_base = {}
+ERRS = {}                       # fetch errors per market (only first few are logged)
 DISPLAY = {}                    # (market, api symbol) -> name shown in alerts
 SPOT_BASES = set()              # coins already scanned on spot (skip on alpha)
 
@@ -207,7 +208,7 @@ def klines(m, symbol, interval, limit):
                   {"symbol": symbol, "interval": interval, "limit": limit})
         data = res.get("data") if isinstance(res, dict) else None
         if not data:
-            raise RuntimeError("alpha klines empty")
+            raise RuntimeError("alpha klines empty: " + json.dumps(res)[:300])
         return data
     return api(m, MARKETS[m]["prefix"] + "/klines",
                {"symbol": symbol, "interval": interval, "limit": limit})
@@ -219,7 +220,9 @@ def fetch_symbol(m, s):
         try:
             d[tf] = klines(m, s, tf, limit)
         except Exception as e:
-            logging.warning("%s %s %s fetch error: %s", m, s, tf, e)
+            ERRS[m] = ERRS.get(m, 0) + 1
+            if ERRS[m] <= 3:
+                logging.warning("%s %s %s fetch error: %s", m, s, tf, e)
     return s, (d or None)
 
 
@@ -361,7 +364,8 @@ def main():
                         check_squeeze(m, name, tf, d[tf], alerts)
             except Exception as e:
                 logging.warning("%s %s error: %s", m, s, e)
-        logging.info("%s: %d symbols", m, len(symbols))
+        ok = sum(1 for _, d in results if d)
+        logging.info("%s: %d symbols, %d with data, %d fetch errors", m, len(symbols), ok, ERRS.get(m, 0))
         total += len(symbols)
 
     flush(alerts)
