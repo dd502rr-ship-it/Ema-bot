@@ -33,10 +33,19 @@ MARKETS = {
         "workers": 3,
         "m15_limit": 99,
     },
+    "alpha": {
+        "label": "\u0623\u0644\u0641\u0627",
+        "bases": ["https://www.binance.com"],
+        "prefix": "/bapi/defi/v1/public",
+        "workers": 5,
+        "m15_limit": 100,
+    },
 }
 
 # ---- scan scope ----
-MIN_QUOTE_VOL_24H = 1_000_000   # skip dead coins (24h volume in USDT)
+MIN_QUOTE_VOL_24H = 300_000     # skip dead coins (24h volume in USDT)
+ALPHA_MIN_VOL_24H = 100_000     # Binance Alpha tokens: min 24h volume in USD
+ALPHA_MAX = 150                 # cap for alpha tokens (keeps run time short)
 MAX_SYMBOLS = 300               # safety cap per market
 
 # ---- EMA alerts ----
@@ -70,6 +79,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 state = {}
 _good_base = {}
+DISPLAY = {}                    # (market, api symbol) -> name shown in alerts
+SPOT_BASES = set()              # coins already scanned on spot (skip on alpha)
 
 
 def load_state():
@@ -144,7 +155,34 @@ def api(m, path, params=None):
     raise RuntimeError(last)
 
 
+def get_alpha_symbols():
+    res = api("alpha", "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list")
+    pairs = []
+    for t in res.get("data") or []:
+        aid = t.get("alphaId")
+        name = (t.get("symbol") or "").upper()
+        if not aid or not name:
+            continue
+        if t.get("offline") or t.get("fullyDelisted"):
+            continue
+        if name in SPOT_BASES or name in STABLES:
+            continue
+        try:
+            qv = float(t.get("volume24h") or 0)
+        except ValueError:
+            continue
+        if qv < ALPHA_MIN_VOL_24H:
+            continue
+        sym = aid + "USDT"
+        DISPLAY[("alpha", sym)] = name + "USDT"
+        pairs.append((sym, qv))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in pairs[:ALPHA_MAX]]
+
+
 def get_symbols(m):
+    if m == "alpha":
+        return get_alpha_symbols()
     data = api(m, MARKETS[m]["prefix"] + "/ticker/24hr")
     pairs = []
     for t in data:
@@ -158,23 +196,31 @@ def get_symbols(m):
             continue
         pairs.append((s, qv))
     pairs.sort(key=lambda x: x[1], reverse=True)
+    if m == "spot":
+        SPOT_BASES.update(s[:-4] for s, _ in pairs)
     return [s for s, _ in pairs[:MAX_SYMBOLS]]
 
 
 def klines(m, symbol, interval, limit):
+    if m == "alpha":
+        res = api(m, "/bapi/defi/v1/public/alpha-trade/klines",
+                  {"symbol": symbol, "interval": interval, "limit": limit})
+        data = res.get("data") if isinstance(res, dict) else None
+        if not data:
+            raise RuntimeError("alpha klines empty")
+        return data
     return api(m, MARKETS[m]["prefix"] + "/klines",
                {"symbol": symbol, "interval": interval, "limit": limit})
 
 
 def fetch_symbol(m, s):
-    try:
-        d = {"15m": klines(m, s, "15m", MARKETS[m]["m15_limit"])}
-        for tf in TF:
-            d[tf] = klines(m, s, tf, 400)
-        return s, d
-    except Exception as e:
-        logging.warning("%s %s fetch error: %s", m, s, e)
-        return s, None
+    d = {}
+    for tf, limit in [("15m", MARKETS[m]["m15_limit"])] + [(t, 400) for t in TF]:
+        try:
+            d[tf] = klines(m, s, tf, limit)
+        except Exception as e:
+            logging.warning("%s %s %s fetch error: %s", m, s, tf, e)
+    return s, (d or None)
 
 
 def ema_series(values, period):
@@ -303,14 +349,19 @@ def main():
         for s, d in results:
             if not d:
                 continue
+            name = DISPLAY.get((m, s), s)
             try:
-                check_liquidity(m, s, d["15m"], alerts)
+                if "15m" in d:
+                    check_liquidity(m, name, d["15m"], alerts)
                 for tf in TF:
-                    check_ema(m, s, tf, d[tf], alerts)
+                    if tf in d:
+                        check_ema(m, name, tf, d[tf], alerts)
                 for tf in SQ_TFS:
-                    check_squeeze(m, s, tf, d[tf], alerts)
+                    if tf in d:
+                        check_squeeze(m, name, tf, d[tf], alerts)
             except Exception as e:
                 logging.warning("%s %s error: %s", m, s, e)
+        logging.info("%s: %d symbols", m, len(symbols))
         total += len(symbols)
 
     flush(alerts)
