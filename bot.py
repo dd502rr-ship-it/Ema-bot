@@ -160,4 +160,34 @@ def check_liquidity(symbol):
 
     if ratio >= VOL_SPIKE and buy >= BUY_RATIO and change > 0:
         if can_alert(symbol, "liq"):
-            send(f"💰 <b>{symbol}
+            t1 = "\U0001F4B0 <b>" + symbol + "</b> \u062f\u062e\u0648\u0644 \u0633\u064a\u0648\u0644\u0629!"
+            t2 = "\u062d\u062c\u0645 \u0627\u0644\u0633\u0627\u0639\u0629: " + format(vol, ",.0f") + "$ (" + format(ratio, ".1f") + "x \u0627\u0644\u0645\u062a\u0648\u0633\u0637)"
+            t3 = "\u0646\u0633\u0628\u0629 \u0627\u0644\u0634\u0631\u0627\u0621: " + format(buy * 100, ".0f") + "% | \u062a\u063a\u064a\u0631 \u0627\u0644\u0633\u0627\u0639\u0629: " + format(change, "+.2f") + "%"
+            send(t1 + "\n" + t2 + "\n" + t3)
+
+
+def main():
+    load_state()
+    if MANUAL:
+        send("✅ البوت يعمل (تشغيل يدوي)")
+    try:
+        symbols = get_symbols()
+    except Exception as e:
+        logging.warning("symbols error: %s", e)
+        if can_alert("api_fail"):
+            send("⚠️ تعذر جلب البيانات من المصدر. قد تكون السيرفرات محجوبة.")
+        save_state()
+        return
+    for s in symbols:
+        try:
+            check_ema(s)
+            check_liquidity(s)
+        except Exception as e:
+            logging.warning("%s error: %s", s, e)
+        time.sleep(0.1)
+    save_state()
+    logging.info("تم فحص %d عملة", len(symbols))
+
+
+if __name__ == "__main__":
+    main()
