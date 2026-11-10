@@ -6,38 +6,43 @@ import os
 import json
 import time
 import logging
+import queue
+import threading
 import requests
 from statistics import mean, pstdev
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT_ID"]
 MANUAL = os.environ.get("EVENT") == "workflow_dispatch"
+LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES") or 0)   # keep scanning this long (0 = one scan)
+SCAN_GAP = float(os.environ.get("SCAN_GAP") or 5)   # seconds between two scans
+SEND_GAP = 3.1                  # seconds between Telegram messages (group limit ~20/min)
 
 # markets: spot + USDT-M futures (Binance)
 # note: futures API (fapi) is blocked for US servers, bot reports it and keeps scanning spot
 MARKETS = {
     "spot": {
         "label": "\u0633\u0628\u0648\u062a",
-        "bases": ["https://data-api.binance.vision",
-                  "https://api.binance.com",
+        "bases": ["https://api.binance.com",
+                  "https://data-api.binance.vision",
                   "https://api.binance.us"],
         "prefix": "/api/v3",
-        "workers": 6,
+        "workers": 16,
         "m15_limit": 100,
     },
     "futures": {
         "label": "\u0639\u0642\u0648\u062f",
         "bases": ["https://fapi.binance.com"],
         "prefix": "/fapi/v1",
-        "workers": 3,
+        "workers": 6,
         "m15_limit": 99,
     },
     "alpha": {
         "label": "\u0623\u0644\u0641\u0627",
         "bases": ["https://www.binance.com"],
         "prefix": "/bapi/defi/v1/public",
-        "workers": 5,
+        "workers": 8,
         "m15_limit": 100,
     },
 }
@@ -101,29 +106,41 @@ def save_state():
 
 
 def send(text):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            logging.warning("Telegram %s: %s", r.status_code, r.text[:200])
-    except Exception as e:
-        logging.warning("Telegram error: %s", e)
+    for _ in range(5):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 429:              # too many messages: wait and retry
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(wait + 1)
+                continue
+            if r.status_code != 200:
+                logging.warning("Telegram %s: %s", r.status_code, r.text[:200])
+            return
+        except Exception as e:
+            logging.warning("Telegram error: %s", e)
+            time.sleep(3)
 
 
-def flush(alerts):
-    """Send all alerts of this run in a few combined messages."""
-    alerts.sort(key=lambda a: a[0])
-    chunk = ""
-    for _, text in alerts:
-        if len(chunk) + len(text) + 2 > 3500:
-            send(chunk)
-            chunk = ""
-        chunk += ("\n\n" if chunk else "") + text
-    if chunk:
-        send(chunk)
+OUTQ = queue.Queue()            # alerts waiting to be sent, one message each
+
+
+def sender():
+    while True:
+        text = OUTQ.get()
+        send(text)
+        OUTQ.task_done()
+        time.sleep(SEND_GAP)
+
+
+class Alerts(list):
+    """Every alert is queued for sending the moment it is found."""
+    def append(self, item):
+        super().append(item)
+        OUTQ.put(item[1])
 
 
 def can_alert(*key, cooldown):
@@ -327,12 +344,9 @@ def check_squeeze(m, symbol, interval, k, alerts):
                               f"\u0627\u0644\u062d\u062c\u0645 \u064a\u0631\u062a\u0641\u0639: {vratio:.1f}x \u0627\u0644\u0645\u0639\u062a\u0627\u062f{pos}"))
 
 
-def main():
-    load_state()
-    if MANUAL:
-        send("\u2705 \u0627\u0644\u0628\u0648\u062a \u064a\u0639\u0645\u0644 (\u062a\u0634\u063a\u064a\u0644 \u064a\u062f\u0648\u064a)")
-
-    alerts = []
+def scan():
+    ERRS.clear()
+    alerts = Alerts()
     total = 0
     for m, cfg in MARKETS.items():
         try:
@@ -346,31 +360,53 @@ def main():
                     send("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u062c\u0644\u0628 \u0628\u064a\u0627\u0646\u0627\u062a \u0633\u0648\u0642 (" + cfg["label"] + ").")
             continue
 
+        ok = 0
         with ThreadPoolExecutor(cfg["workers"]) as ex:
-            results = list(ex.map(lambda sym: fetch_symbol(m, sym), symbols))
-
-        for s, d in results:
-            if not d:
-                continue
-            name = DISPLAY.get((m, s), s)
-            try:
-                if "15m" in d:
-                    check_liquidity(m, name, d["15m"], alerts)
-                for tf in TF:
-                    if tf in d:
-                        check_ema(m, name, tf, d[tf], alerts)
-                for tf in SQ_TFS:
-                    if tf in d:
-                        check_squeeze(m, name, tf, d[tf], alerts)
-            except Exception as e:
-                logging.warning("%s %s error: %s", m, s, e)
-        ok = sum(1 for _, d in results if d)
+            futs = [ex.submit(fetch_symbol, m, sym) for sym in symbols]
+            for f in as_completed(futs):
+                s, d = f.result()
+                if not d:
+                    continue
+                ok += 1
+                check_symbol(m, s, d, alerts)
         logging.info("%s: %d symbols, %d with data, %d fetch errors", m, len(symbols), ok, ERRS.get(m, 0))
         total += len(symbols)
 
-    flush(alerts)
     save_state()
     logging.info("scanned %d symbols, %d alerts", total, len(alerts))
+
+
+def check_symbol(m, s, d, alerts):
+    name = DISPLAY.get((m, s), s)
+    try:
+        if "15m" in d:
+            check_liquidity(m, name, d["15m"], alerts)
+        for tf in TF:
+            if tf in d:
+                check_ema(m, name, tf, d[tf], alerts)
+        for tf in SQ_TFS:
+            if tf in d:
+                check_squeeze(m, name, tf, d[tf], alerts)
+    except Exception as e:
+        logging.warning("%s %s error: %s", m, s, e)
+
+
+def main():
+    load_state()
+    threading.Thread(target=sender, daemon=True).start()
+    if MANUAL:
+        send("\u2705 \u0627\u0644\u0628\u0648\u062a \u064a\u0639\u0645\u0644 (\u062a\u0634\u063a\u064a\u0644 \u064a\u062f\u0648\u064a)")
+    end = time.time() + LOOP_MINUTES * 60
+    while True:
+        start = time.time()
+        try:
+            scan()
+        except Exception as e:
+            logging.warning("scan error: %s", e)
+        if time.time() + SCAN_GAP >= end:
+            break
+        time.sleep(max(0, SCAN_GAP - (time.time() - start)))
+    OUTQ.join()                 # let queued messages go out before exiting
 
 
 if __name__ == "__main__":
