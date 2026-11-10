@@ -54,7 +54,7 @@ ALPHA_MAX = 150                 # cap for alpha tokens (keeps run time short)
 MAX_SYMBOLS = 300               # safety cap per market
 
 # ---- EMA alerts ----
-EMA_PERIODS = (100, 200)
+EMA_PERIODS = (200,)
 TOUCH_PCT = 0.3                 # "reached EMA" if within 0.3 percent
 # interval -> (label, cooldown seconds)
 TF = {
@@ -65,7 +65,7 @@ TF = {
 
 # ---- liquidity inflow (15m candle) ----
 LIQ_SPIKE = 4.0                 # last 15m volume >= 4x average of prior 24h
-LIQ_BUY_RATIO = 0.60            # aggressive buying share >= 60 percent
+LIQ_BUY_RATIO = 0.60            # aggressive buying (inflow) or selling (outflow) share >= 60 percent
 LIQ_MIN_CANDLE_USD = 50_000     # ignore tiny volumes
 LIQ_COOLDOWN = 3 * 3600
 
@@ -301,6 +301,14 @@ def check_liquidity(m, symbol, k, alerts):
             alerts.append((0, f"\U0001f4b0 <b>{symbol}</b> [{mk}] \u062f\u062e\u0648\u0644 \u0633\u064a\u0648\u0644\u0629!\n"
                               f"\u062d\u062c\u0645 \u0622\u062e\u0631 15 \u062f\u0642\u064a\u0642\u0629: {vol:,.0f}$ ({ratio:.1f}x \u0627\u0644\u0645\u0639\u062a\u0627\u062f)\n"
                               f"\u0646\u0633\u0628\u0629 \u0627\u0644\u0634\u0631\u0627\u0621: {buy*100:.0f}% | \u062a\u063a\u064a\u0631 \u0627\u0644\u0634\u0645\u0639\u0629: {change:+.2f}%"))
+
+    # liquidity outflow: same volume spike, but sellers dominate and the candle is red
+    sell = 1 - buy
+    if ratio >= LIQ_SPIKE and sell >= LIQ_BUY_RATIO and change < 0:
+        if can_alert(m, symbol, "liq_out", cooldown=LIQ_COOLDOWN):
+            alerts.append((0, f"\U0001f4b8 <b>{symbol}</b> [{mk}] \u062e\u0631\u0648\u062c \u0633\u064a\u0648\u0644\u0629!\n"
+                              f"\u062d\u062c\u0645 \u0622\u062e\u0631 15 \u062f\u0642\u064a\u0642\u0629: {vol:,.0f}$ ({ratio:.1f}x \u0627\u0644\u0645\u0639\u062a\u0627\u062f)\n"
+                              f"\u0646\u0633\u0628\u0629 \u0627\u0644\u0628\u064a\u0639: {sell*100:.0f}% | \u062a\u063a\u064a\u0631 \u0627\u0644\u0634\u0645\u0639\u0629: {change:+.2f}%"))
 
 
 def bb_width(seg):
