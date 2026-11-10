@@ -1,5 +1,5 @@
 """
-EMA100/EMA200 + liquidity inflow + pre-breakout squeeze alerts.
+EMA200 (+RSI) + liquidity inflow/outflow + pre-breakout squeeze alerts, Binance futures.
 GitHub Actions version: one scan per run. Secrets come from environment.
 """
 import os
@@ -19,31 +19,14 @@ LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES") or 0)   # keep scanning this
 SCAN_GAP = float(os.environ.get("SCAN_GAP") or 5)   # seconds between two scans
 SEND_GAP = 3.1                  # seconds between Telegram messages (group limit ~20/min)
 
-# markets: spot + USDT-M futures (Binance)
-# note: futures API (fapi) is blocked for US servers, bot reports it and keeps scanning spot
+# market: Binance USDT-M futures only (spot and alpha removed on request)
 MARKETS = {
-    "spot": {
-        "label": "\u0633\u0628\u0648\u062a",
-        "bases": ["https://api.binance.com",
-                  "https://data-api.binance.vision",
-                  "https://api.binance.us"],
-        "prefix": "/api/v3",
-        "workers": 16,
-        "m15_limit": 100,
-    },
     "futures": {
         "label": "\u0639\u0642\u0648\u062f",
         "bases": ["https://fapi.binance.com"],
         "prefix": "/fapi/v1",
         "workers": 6,
         "m15_limit": 99,
-    },
-    "alpha": {
-        "label": "\u0623\u0644\u0641\u0627",
-        "bases": ["https://www.binance.com"],
-        "prefix": "/bapi/defi/v1/public",
-        "workers": 8,
-        "m15_limit": 100,
     },
 }
 
@@ -56,6 +39,7 @@ MAX_SYMBOLS = 300               # safety cap per market
 # ---- EMA alerts ----
 EMA_PERIODS = (200,)
 TOUCH_PCT = 0.3                 # "reached EMA" if within 0.3 percent
+RSI_PERIOD = 14                 # RSI shown with every EMA200 cross
 # interval -> (label, cooldown seconds)
 TF = {
     "1h": ("\u0633\u0627\u0639\u0629", 2 * 3600),
@@ -254,6 +238,31 @@ def ema_series(values, period):
     return out
 
 
+def rsi(values, period=RSI_PERIOD):
+    """Wilder RSI (same as TradingView) of the last value."""
+    if len(values) <= period:
+        return None
+    gains = losses = 0.0
+    for a, b in zip(values[:period], values[1:period + 1]):
+        d = b - a
+        gains += max(d, 0)
+        losses += max(-d, 0)
+    ag, al = gains / period, losses / period
+    for a, b in zip(values[period:], values[period + 1:]):
+        d = b - a
+        ag = (ag * (period - 1) + max(d, 0)) / period
+        al = (al * (period - 1) + max(-d, 0)) / period
+    if al == 0:
+        return 100.0
+    return 100 - 100 / (1 + ag / al)
+
+
+def rsi_text(r):
+    if r is None:
+        return ""
+    return f"\nRSI({RSI_PERIOD}): {r:.1f}"
+
+
 def check_ema(m, symbol, interval, k, alerts):
     label, cooldown = TF[interval]
     mk = MARKETS[m]["label"]
@@ -274,7 +283,8 @@ def check_ema(m, symbol, interval, k, alerts):
             kind = "\u0627\u062e\u062a\u0631\u0642 \u0644\u0644\u0623\u0639\u0644\u0649 \u2705" if price > ema else "\u0643\u0633\u0631 \u0644\u0644\u0623\u0633\u0641\u0644 \u274c"
             if can_alert(m, symbol, interval, p, "cross", cooldown=cooldown):
                 alerts.append((2, f"\U0001f4ca <b>{symbol}</b> [{mk}] {kind} EMA{p} {tf}\n"
-                                  f"\u0627\u0644\u0633\u0639\u0631: {price:g} | EMA{p}: {ema:.6g}"))
+                                  f"\u0627\u0644\u0633\u0639\u0631: {price:g} | EMA{p}: {ema:.6g}"
+                                  + rsi_text(rsi(closes))))
         elif lo <= ema <= hi or abs(dist) <= TOUCH_PCT:
             # touched the line (wick or body) in the current candle: one alert per candle
             if can_alert(m, symbol, interval, p, "touch", candle, cooldown=24 * 3600):
